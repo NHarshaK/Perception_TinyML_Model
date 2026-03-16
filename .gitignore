@@ -3,3 +3,6 @@ res10_300x300_ssd_iter_140000.caffemodel
 hand_landmarker.task
 saved_*.jpg
 __pycache__/
+res10_300x300_ssd_iter_140000.caffemodel
+deploy.prototxt
+__pycache__/
