@@ -1,529 +1,403 @@
-"""
-TinyML Face Detection - Laptop Version
-Run MobileNetV2-SSD face detection directly on your laptop with webcam
-"""
-
-import tensorflow as tf
-import numpy as np
 import cv2
+import numpy as np
 import time
 import os
+import urllib.request
+from collections import deque
 
-print(f"TensorFlow version: {tf.__version__}")
-print(f"OpenCV version: {cv2.__version__}")
+try:
+    import torch
+    import torchvision.models as tv_models
+    import torchvision.transforms as T
+except ImportError:
+    print("Install PyTorch:  pip install torch torchvision")
+    exit(1)
 
-# Configuration
-class Config:
-    INPUT_SIZE = 96
-    NUM_CLASSES = 2  # background + face
-    ALPHA = 0.35
-    CONFIDENCE_THRESHOLD = 0.5
-    IOU_THRESHOLD = 0.4
-    CAMERA_INDEX = 0  # Default webcam
-    DISPLAY_SCALE = 4  # Scale up the small 96x96 image for display
+DEVICE = (torch.device("mps")  if torch.backends.mps.is_available() else
+          torch.device("cuda") if torch.cuda.is_available() else
+          torch.device("cpu"))
+print(f"OpenCV {cv2.__version__}  PyTorch {torch.__version__}  Device: {DEVICE}")
 
-config = Config()
+# ── Download face model ───────────────────────────────────────────────────────
+MODEL_CONFIG      = "deploy.prototxt"
+MODEL_WEIGHTS     = "res10_300x300_ssd_iter_140000.caffemodel"
+MODEL_CONFIG_URL  = "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt"
+MODEL_WEIGHTS_URL = "https://github.com/opencv/opencv_3rdparty/raw/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
 
+def download_models():
+    for url, path in [(MODEL_CONFIG_URL, MODEL_CONFIG), (MODEL_WEIGHTS_URL, MODEL_WEIGHTS)]:
+        if not os.path.exists(path):
+            print(f"Downloading {path}…")
+            urllib.request.urlretrieve(url, path)
 
-def _make_divisible(v, divisor, min_value=None):
-    """Ensure layers have channels divisible by divisor"""
-    if min_value is None:
-        min_value = divisor
-    new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
-    if new_v < 0.9 * v:
-        new_v += divisor
-    return new_v
+# ── Config ────────────────────────────────────────────────────────────────────
+CAMERA_INDEX       = 0
+FACE_CONF          = 0.6
+CALIB_INTERVAL     = 10   # re-sample face colour every N frames
 
+# Skin calibration tolerances (TIGHTENED to prevent background interference)
+CR_MAD_MULT  = 2.5   # Originally 3.5
+CB_MAD_MULT  = 3.0   # Originally 4.0
+HUE_PAD      = 12    # Originally 18
+HUE_MAX      = 30
 
-def inverted_residual_block(x, expanded_channels, output_channels, stride, block_id):
-    """Inverted residual block for MobileNetV2"""
-    in_channels = x.shape[-1]
-    
-    if block_id:
-        x_expand = tf.keras.layers.Conv2D(expanded_channels, 1, padding='same', 
-                                          use_bias=False, name=f'block_{block_id}_expand')(x)
-        x_expand = tf.keras.layers.BatchNormalization(name=f'block_{block_id}_expand_BN')(x_expand)
-        x_expand = tf.keras.layers.ReLU(6., name=f'block_{block_id}_expand_relu')(x_expand)
+# Hand shape filters
+MIN_AREA       = 3500
+MAX_AREA_FRAC  = 0.30
+MAX_HULL_FRAC  = 0.32
+MIN_SOL        = 0.30
+MAX_SOL        = 0.97
+MIN_WH         = 0.40
+MAX_WH         = 1.85
+MIN_DEFECT     = 6000   # depth threshold for fingertip detection
+
+# Finger geometry
+FINGER_ZONE  = 0.62   # only look for tips in top 62% of contour height
+ISOLATION    = 0.15   # tip must be 15% of hand height above next tip to be labelled
+DISPLAY_FRAC = 0.62   # draw hull over top 62% only (hides wrist/arm)
+
+# Temporal smoothing
+SMOOTH_WIN  = 3
+SMOOTH_HITS = 2
+
+# Face exclusion
+FACE_PAD         = 10
+NECK_EXT         = 0.22
+SHOULDER_SIDE    = 0.45
+SHOULDER_VERT    = 0.35
+
+# Colours
+C_FACE   = (  0, 255,   0)
+C_HULL   = (  0, 200, 255)
+C_VALLEY = (  0,   0, 255)
+C_TIP    = (255, 255, 255)
+C_LABEL  = ( 30,  30,  30)
+
+# ── Face detection ────────────────────────────────────────────────────────────
+def detect_faces(net, frame):
+    h, w = frame.shape[:2]
+    blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300,300)), 1.0, (300,300), (104,177,123))
+    net.setInput(blob)
+    dets = net.forward()
+    boxes, scores = [], []
+    for i in range(dets.shape[2]):
+        c = dets[0,0,i,2]
+        if c > FACE_CONF:
+            boxes.append([max(0.,dets[0,0,i,3]), max(0.,dets[0,0,i,4]),
+                          min(1.,dets[0,0,i,5]), min(1.,dets[0,0,i,6])])
+            scores.append(float(c))
+    return np.array(boxes), np.array(scores)
+
+# ── Skin calibration ──────────────────────────────────────────────────────────
+def sample_skin(frame, face_boxes):
+    """Sample cheek region, return (median_ycc, mad_ycc, mean_hsv) or None."""
+    if not len(face_boxes):
+        return None
+    h, w = frame.shape[:2]
+    b = face_boxes[0]
+    fx1,fy1 = int(b[0]*w), int(b[1]*h)
+    fx2,fy2 = int(b[2]*w), int(b[3]*h)
+    fh, fw = fy2-fy1, fx2-fx1
+    py1 = fy1+int(fh*0.45); py2 = fy1+int(fh*0.70)
+    px1 = fx1+int(fw*0.30); px2 = fx1+int(fw*0.70)
+    ycc = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)[py1:py2,px1:px2].reshape(-1,3).astype(float)
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)   [py1:py2,px1:px2].reshape(-1,3).astype(float)
+    yl, yh = np.percentile(ycc[:,0],30), np.percentile(ycc[:,0],90)
+    keep = (ycc[:,0]>=yl)&(ycc[:,0]<=yh)
+    ycc, hsv = ycc[keep], hsv[keep]
+    if len(ycc) < 20: return None
+    med = np.median(ycc, axis=0)
+    mad = np.median(np.abs(ycc-med), axis=0) * 1.4826
+    return med, mad, hsv.mean(axis=0)
+
+def skin_mask(frame, calib):
+    b = cv2.GaussianBlur(frame, (5,5), 0)
+    ycc = cv2.cvtColor(b, cv2.COLOR_BGR2YCrCb)
+    hsv = cv2.cvtColor(b, cv2.COLOR_BGR2HSV)
+    if calib is None:
+        m1 = cv2.inRange(ycc, np.array([0,133,90],np.uint8), np.array([255,182,135],np.uint8))
+        m2 = cv2.inRange(hsv, np.array([0,20,40],np.uint8),  np.array([25,255,255],np.uint8))
     else:
-        x_expand = x
-    
-    x_depthwise = tf.keras.layers.DepthwiseConv2D(3, strides=stride, padding='same',
-                                                   use_bias=False, 
-                                                   name=f'block_{block_id}_depthwise')(x_expand)
-    x_depthwise = tf.keras.layers.BatchNormalization(name=f'block_{block_id}_depthwise_BN')(x_depthwise)
-    x_depthwise = tf.keras.layers.ReLU(6., name=f'block_{block_id}_depthwise_relu')(x_depthwise)
-    
-    x_project = tf.keras.layers.Conv2D(output_channels, 1, padding='same', use_bias=False,
-                                       name=f'block_{block_id}_project')(x_depthwise)
-    x_project = tf.keras.layers.BatchNormalization(name=f'block_{block_id}_project_BN')(x_project)
-    
-    if stride == 1 and in_channels == output_channels:
-        return tf.keras.layers.Add(name=f'block_{block_id}_add')([x, x_project])
-    else:
-        return x_project
+        med, mad, mhsv = calib
+        cr_lo = max(118, int(med[1]-CR_MAD_MULT*max(mad[1],6)))
+        cr_hi = min(255, int(med[1]+CR_MAD_MULT*max(mad[1],6)))
+        cb_lo = max(85,  int(med[2]-CB_MAD_MULT*max(mad[2],5)))
+        cb_hi = min(255, int(med[2]+CB_MAD_MULT*max(mad[2],5)))
+        h_lo  = max(0,   int(mhsv[0]-HUE_PAD))
+        h_hi  = min(HUE_MAX, int(mhsv[0]+HUE_PAD))
+        m1 = cv2.inRange(ycc, np.array([0,cr_lo,cb_lo],np.uint8), np.array([255,cr_hi,cb_hi],np.uint8))
+        m2 = cv2.inRange(hsv, np.array([h_lo,15,30],np.uint8),    np.array([h_hi,255,255],np.uint8))
+    mask = cv2.bitwise_and(m1, m2)
+    k    = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(9,9))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(5,5)))
+    mask = cv2.dilate(mask, k, iterations=1)
+    return mask
 
+# ── Body exclusion ────────────────────────────────────────────────────────────
+def exclude_body(mask, face_boxes, shape):
+    fh, fw = shape[:2]
+    cv2.rectangle(mask, (0,int(fh*0.88)), (fw,fh), 0, -1)
+    for b in face_boxes:
+        fx1,fy1 = int(b[0]*fw), int(b[1]*fh)
+        fx2,fy2 = int(b[2]*fw), int(b[3]*fh)
+        faceW = fx2-fx1
+        p = FACE_PAD
+        cv2.rectangle(mask, (fx1-p,fy1-p), (fx2+p,fy2+p), 0, -1)
+        # Column above face — stops wall colour bridging hand blob through top of frame
+        cv2.rectangle(mask, (fx1-p*2,0), (fx2+p*2,max(0,fy1-p)), 0, -1)
+        cv2.rectangle(mask, (fx1,fy2), (fx2,min(fh,fy2+int(NECK_EXT*fh))), 0, -1)
+        sw  = int(faceW*SHOULDER_SIDE)
+        sy2 = min(fh, fy2+int(SHOULDER_VERT*fh))
+        cv2.rectangle(mask, (fx1-sw,fy1), (fx1+p, sy2), 0, -1)
+        cv2.rectangle(mask, (fx2-p, fy1), (fx2+sw,sy2), 0, -1)
+    return mask
 
-def create_mobilenetv2_backbone(input_shape, alpha=0.35):
-    """Create MobileNetV2 backbone"""
-    inputs = tf.keras.layers.Input(shape=input_shape)
-    
-    first_block_filters = _make_divisible(32 * alpha, 8)
-    x = tf.keras.layers.Conv2D(first_block_filters, 3, strides=2, padding='same',
-                               use_bias=False, name='Conv1')(inputs)
-    x = tf.keras.layers.BatchNormalization(name='bn_Conv1')(x)
-    x = tf.keras.layers.ReLU(6., name='Conv1_relu')(x)
-    
-    inverted_residual_setting = [
-        [1, 16, 1, 1],
-        [6, 24, 2, 2],
-        [6, 32, 3, 2],
-        [6, 64, 4, 2],
-        [6, 96, 3, 1],
-        [6, 160, 3, 2],
-        [6, 320, 1, 1],
-    ]
-    
-    feature_maps = []
-    block_id = 0
-    
-    for t, c, n, s in inverted_residual_setting:
-        output_channel = _make_divisible(c * alpha, 8)
-        
-        for i in range(n):
-            stride = s if i == 0 else 1
-            expanded_channels = int(x.shape[-1] * t)
-            x = inverted_residual_block(x, expanded_channels, output_channel, 
-                                       stride, block_id)
-            block_id += 1
-        
-        if block_id in [3, 6, 13, 17]:
-            feature_maps.append(x)
-    
-    x = tf.keras.layers.Conv2D(_make_divisible(512 * alpha, 8), 1, padding='same',
-                               name='Conv_extra_1')(x)
-    x = tf.keras.layers.ReLU(6., name='Conv_extra_1_relu')(x)
-    feature_maps.append(x)
-    
-    x = tf.keras.layers.Conv2D(_make_divisible(256 * alpha, 8), 1, padding='same',
-                               name='Conv_extra_2')(x)
-    x = tf.keras.layers.ReLU(6., name='Conv_extra_2_relu')(x)
-    feature_maps.append(x)
-    
-    model = tf.keras.Model(inputs=inputs, outputs=feature_maps, name='MobileNetV2_Backbone')
-    return model
+# ── Hand contours ─────────────────────────────────────────────────────────────
+def find_hands(mask, face_boxes, shape):
+    exclude_body(mask, face_boxes, shape)
+    fh, fw = shape[:2]; fa = fh*fw
+    cnts,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    valid = []
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if not (MIN_AREA <= area <= MAX_AREA_FRAC*fa): continue
+        hull = cv2.convexHull(c); ha = cv2.contourArea(hull)
+        if ha < 1 or ha > MAX_HULL_FRAC*fa: continue
+        sol = area/ha
+        if not (MIN_SOL <= sol <= MAX_SOL): continue
+        _,_,bw,bh = cv2.boundingRect(c)
+        wh = bw/bh if bh>0 else 0
+        if not (MIN_WH <= wh <= MAX_WH): continue
+        hi = cv2.convexHull(c, returnPoints=False)
+        d  = cv2.convexityDefects(c, hi) if hi is not None and len(hi)>=3 else None
+        max_d = int(d[:,0,3].max()) if d is not None else 0
+        if max_d < MIN_DEFECT and sol < 0.75: continue   # allow fists through via high solidity
+        valid.append(c)
+    valid.sort(key=cv2.contourArea, reverse=True)
+    return valid[:2]
 
+# ── Finger geometry ───────────────────────────────────────────────────────────
+def contour_y_range(c):
+    pts = c[:,0,1]
+    return int(pts.min()), int(pts.max())
 
-def create_prediction_head(feature_map, num_boxes, num_classes, name_prefix):
-    """Create classification and localization prediction heads"""
-    conf = tf.keras.layers.Conv2D(num_boxes * num_classes, 3, padding='same',
-                                  name=f'{name_prefix}_conf')(feature_map)
-    
-    loc = tf.keras.layers.Conv2D(num_boxes * 4, 3, padding='same',
-                                 name=f'{name_prefix}_loc')(feature_map)
-    
-    return conf, loc
+def detect_fingers(contour):
+    hi = cv2.convexHull(contour, returnPoints=False)
+    if hi is None or len(hi)<3: return [], []
+    defects = cv2.convexityDefects(contour, hi)
+    ymin, ymax = contour_y_range(contour)
+    y_cut = ymin + int((ymax-ymin)*FINGER_ZONE)
+    tips, valleys = set(), set()
+    if defects is not None:
+        for d in defects:
+            s,e,f,depth = d[0]
+            if depth < MIN_DEFECT: continue
+            st = tuple(contour[s][0]); en = tuple(contour[e][0]); va = tuple(contour[f][0])
+            a = np.linalg.norm(np.subtract(st,va))
+            b = np.linalg.norm(np.subtract(en,va))
+            cc= np.linalg.norm(np.subtract(st,en))
+            d2 = 2*a*b
+            if d2==0: continue
+            angle = np.degrees(np.arccos(np.clip((a**2+b**2-cc**2)/d2,-1,1)))
+            if angle < 90:
+                if st[1]<=y_cut: tips.add(st)
+                if en[1]<=y_cut: tips.add(en)
+                if va[1]<=y_cut: valleys.add(va)
+    # Topmost hull vertex fallback — catches single extended finger
+    hull_pts = cv2.convexHull(contour)
+    top_pt   = tuple(hull_pts[int(hull_pts[:,0,1].argmin())][0])
+    if top_pt[1] <= y_cut:
+        tips.add(top_pt)
+    return list(tips), list(valleys)
 
+def classify_finger(tip, contour):
+    M = cv2.moments(contour)
+    if M["m00"]==0: return None
+    cx = int(M["m10"]/M["m00"]); cy = int(M["m01"]/M["m00"])
+    angle = np.degrees(np.arctan2(cy-tip[1], tip[0]-cx))
+    if  60 <= angle <= 120: return "Index Finger"
+    if -30 <= angle <  60 or 120 < angle <= 200: return "Thumb"
+    return None
 
-def create_face_detector(input_shape=(96, 96, 3), num_classes=2, alpha=0.35):
-    """Create complete face detection model"""
-    num_boxes = [3, 6, 6, 6, 6, 6]
+def label_fingers(tips, contour):
+    """Labels fingers without strictly checking if they are isolated."""
+    if not tips: return {}
+    ymin, ymax = contour_y_range(contour)
+    hand_h = max(1, ymax-ymin)
+    sorted_tips = sorted(tips, key=lambda t: t[1])   # top first
     
-    backbone = create_mobilenetv2_backbone(input_shape, alpha)
-    feature_maps = backbone.output
-    
-    all_conf_outputs = []
-    all_loc_outputs = []
-    
-    for i, feature_map in enumerate(feature_maps):
-        conf, loc = create_prediction_head(feature_map, num_boxes[i], num_classes, 
-                                          f'feature_map_{i}')
-        
-        conf_reshaped = tf.keras.layers.Reshape((-1, num_classes), 
-                                               name=f'conf_reshape_{i}')(conf)
-        loc_reshaped = tf.keras.layers.Reshape((-1, 4), 
-                                              name=f'loc_reshape_{i}')(loc)
-        
-        all_conf_outputs.append(conf_reshaped)
-        all_loc_outputs.append(loc_reshaped)
-    
-    conf_output = tf.keras.layers.Concatenate(axis=1, name='conf_concat')(all_conf_outputs)
-    loc_output = tf.keras.layers.Concatenate(axis=1, name='loc_concat')(all_loc_outputs)
-    
-    conf_output = tf.keras.layers.Activation('softmax', name='conf_softmax')(conf_output)
-    
-    model = tf.keras.Model(inputs=backbone.input, 
-                          outputs=[conf_output, loc_output],
-                          name='FaceDetector')
-    
-    return model
+    # ISOLATION CHECK REMOVED: 
+    # Open palms will now attempt to be labeled
 
-
-def generate_default_boxes(num_boxes_total, img_size=96):
-    """Generate default anchor boxes for SSD - simplified version"""
-    # Create a grid of default boxes evenly distributed
-    # This is a simplified approach that matches any output size
-    default_boxes = []
+    labels = {}
+    top = sorted_tips[0]
+    name = classify_finger(top, contour)
+    if name: labels[top] = name
     
-    # Calculate grid size
-    grid_size = int(np.sqrt(num_boxes_total / 3))  # Approximate grid
-    if grid_size < 1:
-        grid_size = 1
-    
-    # Generate boxes in a grid pattern
-    for i in range(grid_size):
-        for j in range(grid_size):
-            cx = (j + 0.5) / grid_size
-            cy = (i + 0.5) / grid_size
+    # Check 2nd tip too (isolation check removed here as well)
+    if len(sorted_tips) >= 2:
+        n2 = classify_finger(sorted_tips[1], contour)
+        if n2 and n2 != name: labels[sorted_tips[1]] = n2
             
-            # Multiple scales and aspect ratios
-            for scale in [0.1, 0.3, 0.5]:
-                for ratio in [1.0, 1.5, 2.0]:
-                    if len(default_boxes) >= num_boxes_total:
-                        break
-                    w = scale * np.sqrt(ratio)
-                    h = scale / np.sqrt(ratio)
-                    default_boxes.append([cx, cy, w, h])
-                if len(default_boxes) >= num_boxes_total:
-                    break
-            if len(default_boxes) >= num_boxes_total:
-                break
-        if len(default_boxes) >= num_boxes_total:
-            break
-    
-    # Pad if needed
-    while len(default_boxes) < num_boxes_total:
-        default_boxes.append([0.5, 0.5, 0.1, 0.1])
-    
-    return np.array(default_boxes[:num_boxes_total], dtype=np.float32)
+    return labels
 
+# ── Temporal smoother ─────────────────────────────────────────────────────────
+class HandSmoother:
+    TOL = 60
+    def __init__(self):
+        self.history = deque(maxlen=SMOOTH_WIN)
+    def update(self, hands):
+        self.history.append([(h["bbox"][0]+h["bbox"][2]//2,
+                               h["bbox"][1]+h["bbox"][3]//2) for h in hands])
+    def confirmed(self, hands):
+        out = []
+        for h in hands:
+            bx,by,bw,bh = h["bbox"]
+            cx,cy = bx+bw//2, by+bh//2
+            hits = sum(any((cx-px)**2+(cy-py)**2 < self.TOL**2 for px,py in past)
+                       for past in self.history)
+            if hits >= SMOOTH_HITS: out.append(h)
+        return out
 
-def decode_predictions(conf_pred, loc_pred, default_boxes, 
-                      conf_threshold=0.5, iou_threshold=0.4):
-    """Decode model predictions to bounding boxes"""
-    # Get face class confidences (index 1)
-    face_scores = conf_pred[:, 1]
-    
-    # Filter by confidence threshold
-    mask = face_scores > conf_threshold
-    filtered_scores = face_scores[mask]
-    filtered_boxes = loc_pred[mask]
-    filtered_default_boxes = default_boxes[mask]
-    
-    if len(filtered_scores) == 0:
-        return [], []
-    
-    # Decode bounding boxes
-    decoded_boxes = []
-    for i in range(len(filtered_scores)):
-        # Convert from offset to absolute coordinates
-        cx = filtered_boxes[i, 0] * 0.1 * filtered_default_boxes[i, 2] + filtered_default_boxes[i, 0]
-        cy = filtered_boxes[i, 1] * 0.1 * filtered_default_boxes[i, 3] + filtered_default_boxes[i, 1]
-        w = np.exp(filtered_boxes[i, 2] * 0.2) * filtered_default_boxes[i, 2]
-        h = np.exp(filtered_boxes[i, 3] * 0.2) * filtered_default_boxes[i, 3]
-        
-        # Convert to corner format
-        x1 = max(0, cx - w/2)
-        y1 = max(0, cy - h/2)
-        x2 = min(1, cx + w/2)
-        y2 = min(1, cy + h/2)
-        
-        decoded_boxes.append([x1, y1, x2, y2])
-    
-    decoded_boxes = np.array(decoded_boxes)
-    
-    # Apply NMS
-    indices = non_max_suppression(decoded_boxes, filtered_scores, iou_threshold)
-    
-    final_boxes = decoded_boxes[indices]
-    final_scores = filtered_scores[indices]
-    
-    return final_boxes, final_scores
+# ── MobileNetV2 (display only) ────────────────────────────────────────────────
+class MN2:
+    _T = T.Compose([T.ToPILImage(), T.Resize((224,224)), T.ToTensor(),
+                    T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])])
+    def __init__(self):
+        print("Loading MobileNetV2…")
+        m = tv_models.mobilenet_v2(weights=tv_models.MobileNet_V2_Weights.IMAGENET1K_V1)
+        self.feat = m.features.eval().to(DEVICE)
+        with torch.no_grad(): self.feat(torch.zeros(1,3,224,224,device=DEVICE))
+        print("MobileNetV2 ready.")
+    def ratio(self, frame, contour):
+        fh,fw = frame.shape[:2]
+        x,y,cw,ch = cv2.boundingRect(contour)
+        x1,y1 = max(0,x),max(0,y); x2,y2 = min(fw,x+cw),min(fh,y+ch)
+        if x2-x1<10 or y2-y1<10: return 0.0
+        t = self._T(cv2.cvtColor(frame[y1:y2,x1:x2],cv2.COLOR_BGR2RGB)).unsqueeze(0).to(DEVICE)
+        with torch.no_grad(): f = self.feat(t)[0].mean(0).cpu().numpy()
+        m = f.mean(); return float(f[:3].mean()/m) if m>1e-6 else 0.0
 
+# ── Drawing ───────────────────────────────────────────────────────────────────
+def draw_faces(frame, boxes, scores):
+    fh,fw = frame.shape[:2]
+    for box,score in zip(boxes,scores):
+        x1,y1 = int(box[0]*fw),int(box[1]*fh)
+        x2,y2 = int(box[2]*fw),int(box[3]*fh)
+        cv2.rectangle(frame,(x1,y1),(x2,y2),C_FACE,2)
+        lbl = f"Face {score:.2f}"
+        (tw,th),_ = cv2.getTextSize(lbl,cv2.FONT_HERSHEY_SIMPLEX,0.6,2)
+        cv2.rectangle(frame,(x1,y1-th-10),(x1+tw,y1),C_FACE,-1)
+        cv2.putText(frame,lbl,(x1,y1-5),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,0,0),2)
 
-def non_max_suppression(boxes, scores, iou_threshold):
-    """Non-maximum suppression to remove overlapping boxes"""
-    if len(boxes) == 0:
-        return []
-    
-    indices = np.argsort(scores)[::-1]
-    keep = []
-    
-    while len(indices) > 0:
-        current = indices[0]
-        keep.append(current)
-        
-        if len(indices) == 1:
-            break
-        
-        current_box = boxes[current]
-        other_boxes = boxes[indices[1:]]
-        
-        ious = compute_iou(current_box, other_boxes)
-        
-        indices = indices[1:][ious < iou_threshold]
-    
-    return keep
+def draw_hand(frame, contour, tips, valleys, labels, mn2_ratio):
+    ymin,ymax = contour_y_range(contour)
+    y_cut = ymin+int((ymax-ymin)*DISPLAY_FRAC)
+    clipped = contour[contour[:,0,1]<=y_cut]
+    if len(clipped)>=3:
+        cv2.drawContours(frame,[cv2.convexHull(clipped)],-1,C_HULL,2)
+    for v in valleys:
+        if v[1]<=y_cut: cv2.circle(frame,v,5,C_VALLEY,-1)
+    for tip in tips:
+        cv2.circle(frame,tip,7,C_TIP,-1); cv2.circle(frame,tip,7,C_HULL,2)
+        name = labels.get(tip)
+        if name:
+            tx,ty = tip[0]-10,tip[1]-15
+            (tw,th),_ = cv2.getTextSize(name,cv2.FONT_HERSHEY_SIMPLEX,0.65,2)
+            cv2.rectangle(frame,(tx-3,ty-th-4),(tx+tw+3,ty+4),C_LABEL,-1)
+            cv2.putText(frame,name,(tx,ty),cv2.FONT_HERSHEY_SIMPLEX,0.65,(0,255,255),2)
+    bx,by,bw,bh = cv2.boundingRect(clipped if len(clipped)>=1 else contour)
+    cv2.putText(frame,f"MN2:{mn2_ratio:.2f}",(bx,by+bh+18),cv2.FONT_HERSHEY_SIMPLEX,0.45,C_HULL,1)
 
+def draw_hud(frame, fps, nf, nh, cal):
+    cv2.putText(frame,f"FPS:{fps:.1f}",   (10,30), cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,0),2)
+    cv2.putText(frame,f"Faces:{nf}",      (10,60), cv2.FONT_HERSHEY_SIMPLEX,0.7,C_FACE,2)
+    cv2.putText(frame,f"Hands:{nh}",      (10,90), cv2.FONT_HERSHEY_SIMPLEX,0.7,C_HULL,2)
+    cv2.putText(frame,"CAL" if cal else "INIT",(10,120),cv2.FONT_HERSHEY_SIMPLEX,0.6,
+                (0,255,0) if cal else (0,165,255),2)
+    cv2.putText(frame,"q=quit  s=save  d=mask",(10,frame.shape[0]-10),
+                cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,255,255),1)
 
-def compute_iou(box, boxes):
-    """Compute IoU between one box and multiple boxes"""
-    x1 = np.maximum(box[0], boxes[:, 0])
-    y1 = np.maximum(box[1], boxes[:, 1])
-    x2 = np.minimum(box[2], boxes[:, 2])
-    y2 = np.minimum(box[3], boxes[:, 3])
-    
-    intersection = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
-    
-    box_area = (box[2] - box[0]) * (box[3] - box[1])
-    boxes_area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
-    
-    union = box_area + boxes_area - intersection
-    
-    iou = intersection / (union + 1e-6)
-    
-    return iou
-
-
-class FaceDetectorDemo:
-    """Face detector with webcam support"""
-    
-    def __init__(self, model_path=None):
-        print("\n[1/3] Initializing face detector...")
-        
-        # Create or load model
-        if model_path and os.path.exists(model_path):
-            print(f"Loading model from {model_path}...")
-            self.model = tf.keras.models.load_model(model_path)
-        else:
-            print("Creating new model (untrained - for architecture demo)...")
-            self.model = create_face_detector(
-                input_shape=(config.INPUT_SIZE, config.INPUT_SIZE, 3),
-                num_classes=config.NUM_CLASSES,
-                alpha=config.ALPHA
-            )
-        
-        print(f"Model parameters: {self.model.count_params():,}")
-        
-        # Get actual number of boxes from model output
-        # Run a dummy prediction to get output shape
-        dummy_input = np.zeros((1, config.INPUT_SIZE, config.INPUT_SIZE, 3), dtype=np.float32)
-        conf_out, loc_out = self.model.predict(dummy_input, verbose=0)
-        num_boxes = conf_out.shape[1]
-        
-        print(f"Model output boxes: {num_boxes}")
-        
-        # Generate default boxes matching the model output
-        self.default_boxes = generate_default_boxes(num_boxes, config.INPUT_SIZE)
-        
-        print(f"Default boxes generated: {len(self.default_boxes)}")
-        
-        # Initialize camera
-        print("\n[2/3] Initializing camera...")
-        self.cap = cv2.VideoCapture(config.CAMERA_INDEX)
-        
-        if not self.cap.isOpened():
-            raise RuntimeError("Failed to open camera!")
-        
-        # Set camera properties
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        
-        print("Camera initialized successfully")
-        print("\n[3/3] Setup complete!\n")
-        
-        # Performance tracking
-        self.fps = 0
-        self.frame_count = 0
-        self.start_time = time.time()
-    
-    def preprocess_frame(self, frame):
-        """Preprocess frame for model input"""
-        # Resize to model input size
-        resized = cv2.resize(frame, (config.INPUT_SIZE, config.INPUT_SIZE))
-        
-        # Convert BGR to RGB
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        
-        # Normalize to [0, 1]
-        normalized = rgb.astype(np.float32) / 255.0
-        
-        # Add batch dimension
-        batched = np.expand_dims(normalized, axis=0)
-        
-        return batched
-    
-    def detect_faces(self, frame):
-        """Detect faces in frame"""
-        # Preprocess
-        input_data = self.preprocess_frame(frame)
-        
-        # Inference
-        conf_pred, loc_pred = self.model.predict(input_data, verbose=0)
-        
-        # Decode predictions
-        boxes, scores = decode_predictions(
-            conf_pred[0], 
-            loc_pred[0], 
-            self.default_boxes,
-            config.CONFIDENCE_THRESHOLD,
-            config.IOU_THRESHOLD
-        )
-        
-        return boxes, scores
-    
-    def draw_detections(self, frame, boxes, scores):
-        """Draw bounding boxes on frame"""
-        h, w = frame.shape[:2]
-        
-        for box, score in zip(boxes, scores):
-            # Convert normalized coordinates to pixel coordinates
-            x1 = int(box[0] * w)
-            y1 = int(box[1] * h)
-            x2 = int(box[2] * w)
-            y2 = int(box[3] * h)
-            
-            # Draw bounding box
-            color = (0, 255, 0)  # Green
-            thickness = 2
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
-            
-            # Draw confidence score
-            label = f"Face: {score:.2f}"
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.6
-            font_thickness = 2
-            
-            # Get text size for background
-            (text_w, text_h), baseline = cv2.getTextSize(label, font, font_scale, font_thickness)
-            
-            # Draw background rectangle
-            cv2.rectangle(frame, (x1, y1 - text_h - 10), (x1 + text_w, y1), color, -1)
-            
-            # Draw text
-            cv2.putText(frame, label, (x1, y1 - 5), font, font_scale, (0, 0, 0), font_thickness)
-        
-        return frame
-    
-    def draw_info(self, frame, num_faces):
-        """Draw info overlay"""
-        # FPS
-        fps_text = f"FPS: {self.fps:.1f}"
-        cv2.putText(frame, fps_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                   0.7, (0, 255, 0), 2)
-        
-        # Face count
-        count_text = f"Faces: {num_faces}"
-        cv2.putText(frame, count_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 
-                   0.7, (0, 255, 0), 2)
-        
-        # Instructions
-        instructions = "Press 'q' to quit | 's' to save frame"
-        cv2.putText(frame, instructions, (10, frame.shape[0] - 10), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        
-        return frame
-    
-    def update_fps(self):
-        """Update FPS calculation"""
-        self.frame_count += 1
-        if self.frame_count % 10 == 0:
-            elapsed = time.time() - self.start_time
-            self.fps = self.frame_count / elapsed
-    
-    def run(self):
-        """Run face detection on webcam"""
-        print("=" * 60)
-        print("FACE DETECTION DEMO")
-        print("=" * 60)
-        print("\nControls:")
-        print("  'q' - Quit")
-        print("  's' - Save current frame")
-        print("\nNote: Model is untrained, so detections are random.")
-        print("Train the model first for real face detection!")
-        print("=" * 60)
-        print("\nStarting detection...\n")
-        
-        saved_frame_count = 0
-        
-        try:
-            while True:
-                # Read frame
-                ret, frame = self.cap.read()
-                if not ret:
-                    print("Failed to read frame")
-                    break
-                
-                # Detect faces
-                boxes, scores = self.detect_faces(frame)
-                
-                # Draw detections
-                frame = self.draw_detections(frame, boxes, scores)
-                
-                # Draw info
-                frame = self.draw_info(frame, len(boxes))
-                
-                # Update FPS
-                self.update_fps()
-                
-                # Display
-                cv2.imshow('TinyML Face Detection', frame)
-                
-                # Handle keyboard input
-                key = cv2.waitKey(1) & 0xFF
-                
-                if key == ord('q'):
-                    print("\nQuitting...")
-                    break
-                elif key == ord('s'):
-                    filename = f"detected_face_{saved_frame_count}.jpg"
-                    cv2.imwrite(filename, frame)
-                    print(f"Saved frame: {filename}")
-                    saved_frame_count += 1
-                
-        except KeyboardInterrupt:
-            print("\nInterrupted by user")
-        
-        finally:
-            # Cleanup
-            print("\nCleaning up...")
-            self.cap.release()
-            cv2.destroyAllWindows()
-            
-            print("\n" + "=" * 60)
-            print(f"Session Summary:")
-            print(f"  Frames processed: {self.frame_count}")
-            print(f"  Average FPS: {self.fps:.1f}")
-            print(f"  Frames saved: {saved_frame_count}")
-            print("=" * 60)
-
-
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    """Main function"""
-    print("\n" + "=" * 60)
-    print("TinyML Face Detection - Laptop Demo")
-    print("=" * 60)
-    
-    # Check for GPU
-    gpus = tf.config.list_physical_devices('GPU')
-    if gpus:
-        print(f"\nGPU available: {len(gpus)} device(s)")
-        try:
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-        except RuntimeError as e:
-            print(e)
-    else:
-        print("\nNo GPU found, using CPU")
-    
-    # Create and run detector
-    try:
-        detector = FaceDetectorDemo()
-        detector.run()
-    except Exception as e:
-        print(f"\nError: {e}")
-        import traceback
-        traceback.print_exc()
+    download_models()
+    face_net = cv2.dnn.readNetFromCaffe(MODEL_CONFIG, MODEL_WEIGHTS)
+    mn2      = MN2()
+    cap      = cv2.VideoCapture(CAMERA_INDEX)
+    if not cap.isOpened(): raise RuntimeError("Cannot open camera")
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
+    smoother   = HandSmoother()
+    calib      = None
+    frame_n    = 0
+    fps        = 0.0
+    t0         = time.time()
+    saved      = 0
+    debug_mask = False
 
-if __name__ == '__main__':
+    print("\nRunning — raise your hand, extend one finger to label it.")
+    print("d=mask  s=save  q=quit\n")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret: break
+
+        # Face detection
+        face_boxes, face_scores = detect_faces(face_net, frame)
+
+        # Re-calibrate skin colour from face
+        if frame_n % CALIB_INTERVAL == 0:
+            c = sample_skin(frame, face_boxes)
+            if c is not None: calib = c
+
+        # Skin mask → hand contours
+        raw_mask = skin_mask(frame, calib)
+        contours = find_hands(raw_mask.copy(), face_boxes, frame.shape)
+
+        # Build hand list
+        raw_hands = []
+        for c in contours:
+            tips, valleys = detect_fingers(c)
+            labels        = label_fingers(tips, c)
+            ratio         = mn2.ratio(frame, c)
+            raw_hands.append(dict(contour=c, bbox=cv2.boundingRect(c),
+                                  tips=tips, valleys=valleys, labels=labels, ratio=ratio))
+
+        # Temporal smoothing
+        smoother.update(raw_hands)
+        hands = smoother.confirmed(raw_hands)
+
+        # Debug mask window
+        if debug_mask:
+            dbg = cv2.cvtColor(raw_mask, cv2.COLOR_GRAY2BGR)
+            cv2.putText(dbg,"Skin mask (d=hide)",(10,30),cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,255),2)
+            cv2.imshow("Skin Mask", dbg)
+        else:
+            try: cv2.destroyWindow("Skin Mask")
+            except: pass
+
+        # Draw
+        draw_faces(frame, face_boxes, face_scores)
+        for h in hands:
+            draw_hand(frame, h["contour"], h["tips"], h["valleys"], h["labels"], h["ratio"])
+        draw_hud(frame, fps, len(face_boxes), len(hands), calib is not None)
+
+        frame_n += 1
+        if frame_n % 10 == 0:
+            fps = frame_n / (time.time()-t0)
+
+        cv2.imshow("Hand Detector", frame)
+        key = cv2.waitKey(1) & 0xFF
+        if   key == ord("q"): break
+        elif key == ord("s"):
+            fn = f"saved_{saved}.jpg"; cv2.imwrite(fn,frame); print(f"Saved {fn}"); saved+=1
+        elif key == ord("d"): debug_mask = not debug_mask
+
+    cap.release()
+    cv2.destroyAllWindows()
+    print(f"Done — {frame_n} frames @ {fps:.1f} FPS")
+
+if __name__ == "__main__":
     main()
